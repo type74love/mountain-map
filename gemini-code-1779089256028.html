@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>山ナビMAP (オフライン対応)</title>
+  
+  <!-- Leafletのスタイルとライブラリ（オンライン時にキャッシュされます） -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  
+  <!-- ZIPファイルをJavaScriptで解凍するライブラリ -->
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+
+  <style>
+    body, html { margin: 0; padding: 0; width: 100%; height: 100%; font-family: sans-serif; }
+    #map { width: 100%; height: 100%; z-index: 1; }
+    
+    /* 操作パネルのスタイル */
+    #panel {
+      position: absolute;
+      top: 10px;
+      left: 10px;
+      right: 10px;
+      z-index: 1000;
+      background: rgba(255, 255, 255, 0.95);
+      padding: 12px;
+      border-radius: 8px;
+      box-shadow: 0 2px 10px rgba(0,0,0,0.2);
+    }
+    .status { font-size: 12px; color: #555; margin-top: 5px; }
+    button {
+      margin-top: 5px;
+      padding: 6px 12px;
+      background: #007aff;
+      color: white;
+      border: none;
+      border-radius: 4px;
+      font-size: 14px;
+      width: 100%;
+    }
+    button:active { background: #0056b3; }
+  </style>
+</head>
+<body>
+
+  <div id="panel">
+    <b style="font-size: 16px;">山ナビMAP</b>
+    <input type="file" id="zipfile" accept=".zip" style="margin-top: 8px; width: 100%;">
+    <div id="status" class="status">状況: ZIPファイルを選択してください。</div>
+    <button id="gps-btn" style="display:none;">現在地にジャンプ</button>
+  </div>
+
+  <div id="map"></div>
+
+  <script>
+    // 地図の初期化（最初は日本全体を表示）
+    const map = L.map('map').setView([36.0, 138.0], 5);
+    let currentMarker = null;
+    let currentCircle = null;
+    let userLatLng = null;
+
+    // --- ZIPタイルレイヤーの定義 ---
+    // Leafletの標準タイル機能を拡張して、ZIP内から画像を読み込むように書き換えます
+    L.ZipTileLayer = L.TileLayer.extend({
+      initialize: function(zipInstance, options) {
+        this._zip = zipInstance;
+        // スクリプト側で作ったフォルダ名（std）に合わせます
+        L.TileLayer.prototype.initialize.call(this, 'std/{z}/{x}/{y}.png', options);
+      },
+      createTile: function(coords, done) {
+        const tile = document.createElement('img');
+        
+        // ZIP内のパスを組み立てる (例: std/12/3642/1612.png)
+        const path = `std/${coords.z}/${coords.x}/${coords.y}.png`;
+        const file = this._zip.file(path);
+
+        if (file) {
+          // ZIPから画像データをBlob（バイナリ）として取り出す
+          file.async("blob").then(function(blob) {
+            const url = URL.createObjectURL(blob);
+            tile.onload = function() {
+              URL.revokeObjectURL(url); // メモリ解放
+              done(null, tile);
+            };
+            tile.src = url;
+          }).catch(function(err) {
+            done(err);
+          });
+        } else {
+          // ZIP内にタイルがない場所は透明な画像を返す
+          tile.src = 'data:image/svg+xml;utf8,<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256"></svg>';
+          setTimeout(() => done(null, tile), 0);
+        }
+        return tile;
+      }
+    });
+
+    // --- ファイル読み込み処理 ---
+    document.getElementById('zipfile').addEventListener('change', function(e) {
+      const file = e.target.files[0];
+      if (!file) return;
+
+      const statusDiv = document.getElementById('status');
+      statusDiv.innerText = "状況: ZIPファイルを解凍中...";
+
+      const reader = new FileReader();
+      reader.onload = function(event) {
+        JSZip.loadAsync(event.target.result).then(function(zip) {
+          statusDiv.innerText = "状況: 地図の読み込み完了！山へGO！";
+          
+          // 自作のZIPレイヤーを地図に追加
+          const zipLayer = new L.ZipTileLayer(zip, {
+            minZoom: 12,
+            maxZoom: 15,
+            attribution: '国土地理院'
+          });
+          zipLayer.addTo(map);
+
+          // GPSボタンを表示
+          document.getElementById('gps-btn').style.display = 'block';
+          
+        }).catch(function(err) {
+          statusDiv.innerText = "状況: ZIPの読み込みに失敗しました。 " + err.message;
+        });
+      };
+      reader.readAsArrayBuffer(file);
+    });
+
+    // --- GPS位置情報の常時監視 ---
+    if (navigator.geolocation) {
+      navigator.geolocation.watchPosition(position => {
+        const lat = position.coords.latitude;
+        const lon = position.coords.longitude;
+        const accuracy = position.coords.accuracy; // 精度（メートル）
+        userLatLng = [lat, lon];
+
+        // 現在地のピンと精度サークルの更新
+        if (currentMarker) {
+          currentMarker.setLatLng(userLatLng);
+          currentCircle.setLatLng(userLatLng).setRadius(accuracy);
+        } else {
+          currentMarker = L.marker(userLatLng).addTo(map).bindPopup("現在地").openPopup();
+          currentCircle = L.circle(userLatLng, { radius: accuracy, color: '#007aff', opacity: 0.2 }).addTo(map);
+          
+          // 最初に位置が取れたら、そこへ自動ジャンプ
+          map.setView(userLatLng, 14);
+        }
+      }, error => {
+        console.error("GPS取得エラー:", error);
+      }, {
+        enableHighAccuracy: true, // 高精度モード（山では必須）
+        timeout: 10000,
+        maximumAge: 0
+      });
+    } else {
+      alert("お使いのデバイスはGPSに対応していません。");
+    }
+
+    // 現在地へジャンプするボタンの動作
+    document.getElementById('gps-btn').addEventListener('click', function() {
+      if (userLatLng) {
+        map.setView(userLatLng, 14);
+      } else {
+        alert("現在地を取得中です。しばらくお待ちください。");
+      }
+    });
+  </script>
+</body>
+</html>
